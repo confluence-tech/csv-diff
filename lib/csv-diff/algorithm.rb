@@ -104,6 +104,19 @@ class CSVDiff
             diffs = {}
             potential_moves = Hash.new{ |h, k| h[k] = [] }
 
+            # left_parent/right_parent (the sibling-key arrays for a given parent) are
+            # shared by every row under that parent - for sources with no explicit
+            # parent/child fields, that's *every* row in the file. Looking up a key's
+            # position with Array#index (an O(n) scan) inside the main per-row loop below
+            # made the whole diff O(n^2). Memoize position-lookup hashes instead, keyed on
+            # the cheap `parent` string rather than the (potentially huge) array itself -
+            # Ruby hashes Array keys by their full contents, so keying on the array would
+            # silently reintroduce an O(n) cost on every lookup.
+            index_positions = ->(arr) { arr.each_with_index.to_h }
+            left_key_positions = index_positions.(left_keys)
+            left_positions_by_parent = Hash.new { |h, parent| h[parent] = index_positions.(left_index[parent]) }
+            right_positions_by_parent = Hash.new { |h, parent| h[parent] = index_positions.(right_index[parent]) }
+
             # First identify deletions
             if include_deletes
                 (left_keys - right_keys).each do |key|
@@ -113,13 +126,24 @@ class CSVDiff
                     child = key_vals[parent_field_count..-1].join('~')
                     left_parent = left_index[parent]
                     left_value = left_values[key]
-                    row_idx = left_keys.index(key)
-                    sib_idx = left_parent.index(key)
+                    row_idx = left_key_positions[key]
+                    sib_idx = left_positions_by_parent[parent][key]
                     raise "Can't locate key #{key} in parent #{parent}" unless sib_idx
                     diffs[key] = Diff.new(:delete, left_value, row_idx, sib_idx)
                     potential_moves[child] << key
                     #puts "Delete: #{key}"
                 end
+            end
+
+            # Every row sharing a parent (all rows, for sources with no parent/child
+            # fields) shares the same left_parent & right_parent intersection - compute
+            # it once per parent, not once per row.
+            common_positions = Hash.new do |h, parent|
+                left_parent = left_index[parent]
+                right_parent = right_index[parent]
+                left_common = left_parent & right_parent
+                right_common = right_parent & left_parent
+                h[parent] = [index_positions.(left_common), index_positions.(right_common)]
             end
 
             # Now identify adds/updates
@@ -130,8 +154,8 @@ class CSVDiff
                 right_parent = right_index[parent]
                 left_value = left_values[key]
                 right_value = right_values[key]
-                left_idx = left_parent && left_parent.index(key)
-                right_idx = right_parent && right_parent.index(key)
+                left_idx = left_parent && left_positions_by_parent[parent][key]
+                right_idx = right_parent && right_positions_by_parent[parent][key]
 
                 if left_idx && right_idx
                     if include_updates && (changes = diff_row(left_value, right_value, diff_fields))
@@ -140,10 +164,9 @@ class CSVDiff
                         #puts "Change: #{key}"
                     end
                     if include_moves
-                        left_common = left_parent & right_parent
-                        right_common = right_parent & left_parent
-                        left_pos = left_common.index(key)
-                        right_pos = right_common.index(key)
+                        left_common_pos, right_common_pos = common_positions[parent]
+                        left_pos = left_common_pos[key]
+                        right_pos = right_common_pos[key]
                         if left_pos != right_pos
                             # Move
                             if d = diffs[key]
